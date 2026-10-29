@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 import main
@@ -88,7 +90,34 @@ def test_win_probability_rejects_same_team_twice():
     assert response.status_code == 422
 
 
-def test_win_probability_rejects_blank_prompt_and_missing_prompt():
+def test_win_probability_rejects_out_of_range_season():
+    payload = valid_prediction_payload()
+    payload["season"] = 1900
+
+    response = client.post("/win-probability", json=payload)
+
+    assert response.status_code == 422
+
+
+def test_win_probability_hides_internal_model_error(monkeypatch):
+    setup_prediction_fakes(monkeypatch)
+
+    class BrokenModel:
+        def predict_proba(self, features):
+            raise RuntimeError("internal path or model details")
+
+    monkeypatch.setattr(main, "model", BrokenModel())
+
+    response = client.post("/win-probability", json=valid_prediction_payload())
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == (
+        "Could not calculate win probability. Please try again later."
+    )
+    assert "internal path" not in response.text
+
+
+def test_ask_ai_rejects_blank_or_missing_prompt():
     assert client.post("/ask-ai", json={"prompt": "   "}).status_code == 422
     assert client.post("/ask-ai", json={}).status_code == 422
 
@@ -100,3 +129,42 @@ def test_ask_ai_reports_missing_api_key(monkeypatch):
 
     assert response.status_code == 503
     assert "GROQ_API_KEY" in response.json()["detail"]
+
+
+def test_ask_ai_returns_provider_response(monkeypatch):
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kwargs: SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content="CSK won through strong bowling.")
+                        )
+                    ]
+                )
+            )
+        )
+    )
+    monkeypatch.setattr(main, "groq_client", fake_client)
+
+    response = client.post("/ask-ai", json={"prompt": "Analyse the final."})
+
+    assert response.status_code == 200
+    assert response.json() == {"result": "CSK won through strong bowling."}
+
+
+def test_ask_ai_sanitizes_provider_failure(monkeypatch):
+    def raise_provider_error(**kwargs):
+        raise RuntimeError("provider secret detail")
+
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=raise_provider_error)
+        )
+    )
+    monkeypatch.setattr(main, "groq_client", fake_client)
+
+    response = client.post("/ask-ai", json={"prompt": "Analyse the final."})
+
+    assert response.status_code == 502
+    assert "provider secret detail" not in response.text
